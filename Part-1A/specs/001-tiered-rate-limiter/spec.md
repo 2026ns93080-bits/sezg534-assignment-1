@@ -21,6 +21,7 @@
 - Q: When one request has several validation problems, in what order should the service choose the error response? → A: Validate malformed JSON, then require a JSON object, then validate `client_id`, then validate `tier`.
 - Q: Should HTTP 200 responses include `X-RateLimit-Limit` and `X-RateLimit-Remaining`, and should `Retry-After` appear only on HTTP 429 responses? → A: Include both rate-limit headers on HTTP 200; include `Retry-After` only on HTTP 429.
 - Q: Which policy should the service use for invalid tier settings and a clock that moves backwards? → A: Require positive numeric quota and capacity values; treat backward clock movement as zero elapsed time and retain the last recorded time.
+- Q: Are performance and observability targets (latency, throughput, logging, metrics) in scope for this release? → A: No; performance and observability targets are out of scope for this release.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -100,6 +101,7 @@ As a calling system, I want invalid requests to receive a clear client error wit
 - **NFR-002**: The request and response contract MUST clearly distinguish allowed requests, rate-limited requests, and invalid requests using the statuses, fields, and headers defined in FR-006 and FR-007.
 - **NFR-003**: The implementation MUST remain a single-instance, in-memory service for this release; it MUST NOT imply that decisions are shared across service instances.
 - **NFR-004**: Tier quota changes MUST NOT require changes to the token-bucket decision rules, and changing one tier's quota MUST NOT alter another tier's quota.
+- **NFR-005**: Performance and observability targets for latency, throughput, logging, and metrics are out of scope for this release.
 
 ### Acceptance Criteria
 
@@ -119,6 +121,9 @@ As a calling system, I want invalid requests to receive a clear client error wit
 - **AC-014 (FR-006)**: When validation failures overlap, malformed JSON returns `{"error":"request body must be valid JSON"}` before other checks; valid non-object JSON returns `{"error":"request body must be a JSON object"}`; a JSON object with invalid `client_id` and invalid `tier` returns the applicable `client_id` error; and a JSON object with a valid `client_id` and invalid `tier` returns `{"error":"tier must be one of: free, pro, enterprise"}`. No such validation failure creates or consumes a bucket.
 - **AC-015 (FR-008)**: For every tier, configuration with a zero, negative, non-numeric, or non-finite quota or capacity is rejected and the service does not start; positive finite quota and capacity values are accepted.
 - **AC-016 (FR-005, NFR-001)**: With a bucket exhausted at time `t=100` and configured to refill one token every 30 seconds, moving the clock back to `t=90` and then returning it to `t=100` does not add tokens or change the last recorded time; a check at `t=100` remains rate-limited with `retry_after_seconds=30`.
+- **AC-017 (FR-007, FR-008)**: With `free` configured as quota 2 per 60 seconds and capacity 5, the first check for a new client returns HTTP 200 with `allowed=true`, `limit=2`, and `remaining=4`, and headers `X-RateLimit-Limit: 2` and `X-RateLimit-Remaining: 4`.
+
+> **Note:** `remaining` may exceed `limit` when bucket capacity is greater than quota; no requirement or test may assume `remaining <= limit`.
 
 ### Key Entities
 
@@ -151,7 +156,3 @@ As a calling system, I want invalid requests to receive a clear client error wit
 - A restart is represented by creating a new service instance with empty rate-limit state; its first bucket for a pair starts full according to that tier's configured capacity.
 - Extra fields in an otherwise valid request are ignored.
 - The only supported tier names are `free`, `pro`, and `enterprise`.
-
-## Unresolved Questions
-
-- Whether performance and observability targets are in scope for this release remains unresolved.
