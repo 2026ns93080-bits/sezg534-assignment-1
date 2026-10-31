@@ -1,1 +1,2 @@
 Oct 31 - 10.00 AM - I found the remaining=1 error in my own review, clarify’s scan marked consistency as Clear while it was still wrong, and I fixed it through a second clarify run instead of editing the file by hand.
+Oct 31 - 10.15 AM - I noticed no AC could tell quota from capacity, and the unresolved question never got asked because of the question cap.
