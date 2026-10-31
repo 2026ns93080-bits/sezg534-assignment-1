@@ -6,13 +6,21 @@
 
 **Status**: Ready for Planning
 
-**Input**: Build a rate-limiting microservice that lets a calling system check whether a client request may proceed. Each request identifies a client and its tier. The service applies configurable token-bucket limits for free (10 requests per minute), pro (100 requests per minute), and enterprise (1000 requests per minute); tracks each client's bucket independently; consumes a token for each allowed request; refills over time up to bucket capacity; reports remaining capacity for allowed requests and retry time for rejected requests; and rejects malformed, incomplete, or unknown-tier requests without consuming tokens. State is in memory only. Authentication, persistence, distributed or multi-instance operation, dashboards, and user interfaces are out of scope.
+**Input**: Build a rate-limiting microservice that lets a calling system check whether a client request may proceed. Each request identifies a client and its tier. The service applies configurable token-bucket limits for free (10 requests per minute), pro (100 requests per minute), and enterprise (1000 requests per minute); tracks each (`client_id`, `tier`) pair independently; consumes a token for each allowed request; refills over time up to bucket capacity; reports remaining capacity for allowed requests and retry time for rejected requests; and rejects malformed, incomplete, or unknown-tier requests without consuming tokens. State is in memory only. Authentication, persistence, distributed or multi-instance operation, documentation, OpenAPI, dashboards, and user interfaces are out of scope; `POST /rate-limit/check` is the only service operation.
 
 ## Clarifications
 
 ### Session 2026-10-30
 
 - Q: How should the service respond when `tier` is missing, null, or not a string, as well as when it names an unsupported tier? → A: Return HTTP 400 with `{"error":"tier must be one of: free, pro, enterprise"}` for every missing, null, non-string, or unsupported `tier`.
+
+### Session 2026-10-31
+
+- Q: When a tier's quota and bucket capacity differ, should `limit` and `X-RateLimit-Limit` report the quota or the capacity? → A: Report the configured per-minute quota in both.
+- Q: If the same `client_id` is submitted with a different tier, should it use a separate bucket, switch policy on the same bucket, or be rejected? → A: Bucket identity is the (`client_id`, `tier`) pair; each tier has separate state.
+- Q: When one request has several validation problems, in what order should the service choose the error response? → A: Validate malformed JSON, then require a JSON object, then validate `client_id`, then validate `tier`.
+- Q: Should HTTP 200 responses include `X-RateLimit-Limit` and `X-RateLimit-Remaining`, and should `Retry-After` appear only on HTTP 429 responses? → A: Include both rate-limit headers on HTTP 200; include `Retry-After` only on HTTP 429.
+- Q: Which policy should the service use for invalid tier settings and a clock that moves backwards? → A: Require positive numeric quota and capacity values; treat backward clock movement as zero elapsed time and retain the last recorded time.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -28,15 +36,15 @@ As a calling system, I want to submit a client's identifier and tier and receive
 
 1. **Given** a new client with a configured bucket containing two tokens, **When** the client makes two requests, **Then** both requests are allowed and the returned remaining counts are 1 and 0.
 2. **Given** that client's bucket is empty and refills at two tokens per minute, **When** it makes another request immediately, **Then** it is rejected and told to retry in 30 seconds.
-3. **Given** the same empty bucket, **When** 30 seconds elapse and the client makes a request, **Then** the request is allowed and the returned remaining count is 1.
+3. **Given** the same empty bucket, **When** 30 seconds elapse and the client makes a request, **Then** the request is allowed and the returned remaining count is 0 because the single refilled token is consumed.
 
 ### User Story 2 - Keep client limits independent and tier limits configurable (Priority: P2)
 
-As a service operator, I want tier limits to be configurable and each client to have independent rate-limit state, so that changing one tier's policy or one client's usage does not unintentionally affect other clients or tiers.
+As a service operator, I want tier limits to be configurable and each (`client_id`, `tier`) pair to have independent rate-limit state, so that changing one tier's policy or one pair's usage does not unintentionally affect other pairs or tiers.
 
 **Why this priority**: Independent state and configurable policy make the service useful for more than a single client and allow operators to tune tiers without changing the limiting rules.
 
-**Independent Test**: Exhaust one client's bucket, verify another client can still use its own bucket, then change one tier's configured quota and verify the other tiers retain their configured values.
+**Independent Test**: Exhaust one (`client_id`, `tier`) pair's bucket, verify another pair can still use its own bucket, then change one tier's configured quota and verify the other tiers retain their configured values.
 
 **Acceptance Scenarios**:
 
@@ -45,7 +53,7 @@ As a service operator, I want tier limits to be configurable and each client to 
 
 ### User Story 3 - Receive clear errors for invalid requests (Priority: P3)
 
-As a calling system, I want invalid requests to receive a clear client error without changing rate-limit state, so that I can correct the request without accidentally using the client's quota.
+As a calling system, I want invalid requests to receive a clear client error without changing rate-limit state, so that I can correct the request without accidentally using the (`client_id`, `tier`) pair's quota.
 
 **Why this priority**: Clear validation protects valid clients from malformed calls and makes integration failures diagnosable.
 
@@ -61,12 +69,14 @@ As a calling system, I want invalid requests to receive a clear client error wit
 
 - A client identifier that is absent, null, empty, or not a string is invalid and must not consume tokens.
 - A tier value is case-sensitive and must match exactly one of `free`, `pro`, or `enterprise`.
+- The same `client_id` submitted with a different tier has a separate bucket because bucket identity is the (`client_id`, `tier`) pair.
 - A missing, null, non-string, or unsupported `tier` returns HTTP 400 with `{"error":"tier must be one of: free, pro, enterprise"}` and does not create or consume a bucket.
 - A request with extra JSON fields is accepted; only the defined client identifier and tier fields affect the decision.
 - Refill never raises a bucket above its configured capacity, including after a long idle period.
 - A retry delay is rounded up to the next whole second so the caller is not told to retry before a full token is available.
-- Simultaneous checks for the same client must not allow more requests than the available tokens.
-- A service restart clears all client buckets; no rate-limit state survives the process lifetime.
+- Tier quotas and capacities must be positive finite numbers; invalid configuration prevents service startup. If the clock moves backwards, the elapsed time is zero and the bucket's last recorded time does not change.
+- Simultaneous checks for the same (`client_id`, `tier`) pair must not allow more requests than the available tokens.
+- A service restart clears all buckets for every (`client_id`, `tier`) pair; no rate-limit state survives the process lifetime.
 
 ## Requirements *(mandatory)*
 
@@ -74,19 +84,19 @@ As a calling system, I want invalid requests to receive a clear client error wit
 
 - **FR-001**: The service MUST expose `POST /rate-limit/check`, accepting a JSON object with `client_id` and `tier` fields.
 - **FR-002**: The service MUST provide the default tier quotas of 10 requests per minute for `free`, 100 for `pro`, and 1000 for `enterprise`; these values MUST be configurable separately from the token-bucket decision rules.
-- **FR-003**: The service MUST maintain independent rate-limit state for each client identifier; a request for one client MUST NOT consume another client's tokens.
-- **FR-004**: The service MUST allow a valid request when its client's bucket has at least one token, consume exactly one token for each allowed request, and report the remaining whole-token count.
+- **FR-003**: The service MUST maintain independent rate-limit state for each (`client_id`, `tier`) pair; a request for one pair MUST NOT consume another pair's tokens, including when the client identifier is the same and the tier differs.
+- **FR-004**: The service MUST allow a valid request when its (`client_id`, `tier`) pair's bucket has at least one token, consume exactly one token for each allowed request, and report the remaining whole-token count.
 - **FR-005**: The service MUST refill each bucket over elapsed time at its configured per-minute quota, never exceed its configured capacity, reject requests when fewer than one token is available, and report the whole-second retry delay rounded up to when one token will be available.
-- **FR-006**: The service MUST reject a missing, null, non-string, or unsupported tier, absent or invalid client identifier, malformed JSON, or a request body that is not a JSON object with HTTP 400 and a clear JSON error; validation failures MUST NOT create or consume a client's bucket. A missing, null, non-string, or unsupported `tier` MUST produce `{"error":"tier must be one of: free, pro, enterprise"}`. A missing or null `client_id` MUST produce `{"error":"client_id is required"}`; an empty or non-string `client_id` MUST produce `{"error":"client_id must be a non-empty string"}`; a non-object JSON body MUST produce `{"error":"request body must be a JSON object"}`; malformed JSON MUST produce `{"error":"request body must be valid JSON"}`.
-- **FR-007**: An allowed decision MUST return HTTP 200 and a JSON response containing `allowed: true`, `limit`, and `remaining`. A rate-limited decision MUST return HTTP 429 and a JSON response containing `allowed: false`, `limit`, `remaining: 0`, and `retry_after_seconds`; the response MUST include `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers with the corresponding values.
-- **FR-008**: Tier configuration MUST define each tier's quota and bucket capacity independently of the algorithm. The default quotas are specified in FR-002; the default capacities are 10 tokens for `free`, 100 for `pro`, and 1000 for `enterprise`. Capacities MUST remain configurable separately from the token-bucket decision rules.
+- **FR-006**: The service MUST reject a missing, null, non-string, or unsupported tier, absent or invalid client identifier, malformed JSON, or a request body that is not a JSON object with HTTP 400 and a clear JSON error; validation failures MUST NOT create or consume a bucket. The service MUST validate in this order: malformed JSON, non-object JSON body, `client_id`, then `tier`. A missing, null, non-string, or unsupported `tier` MUST produce `{"error":"tier must be one of: free, pro, enterprise"}`. A missing or null `client_id` MUST produce `{"error":"client_id is required"}`; an empty or non-string `client_id` MUST produce `{"error":"client_id must be a non-empty string"}`; a non-object JSON body MUST produce `{"error":"request body must be a JSON object"}`; malformed JSON MUST produce `{"error":"request body must be valid JSON"}`.
+- **FR-007**: An allowed decision MUST return HTTP 200 and a JSON response containing `allowed: true`, `limit`, and `remaining`, plus `X-RateLimit-Limit` and `X-RateLimit-Remaining` headers matching the `limit` and `remaining` body values. A rate-limited decision MUST return HTTP 429 and a JSON response containing `allowed: false`, `limit`, `remaining: 0`, and `retry_after_seconds`; the response MUST include `Retry-After`, `X-RateLimit-Limit`, and `X-RateLimit-Remaining` headers with the corresponding values. `Retry-After` MUST be included only on HTTP 429 responses. `limit` and `X-RateLimit-Limit` MUST report the configured per-minute quota, not bucket capacity.
+- **FR-008**: Tier configuration MUST define each tier's quota and bucket capacity independently of the algorithm. The default quotas are specified in FR-002; the default capacities are 10 tokens for `free`, 100 for `pro`, and 1000 for `enterprise`. Capacities MUST remain configurable separately from the token-bucket decision rules. Each quota and capacity MUST be a positive finite number; zero, negative, or non-numeric values MUST cause configuration rejection and prevent service startup.
 - **FR-009**: Rate-limit state MUST be held in memory only and MUST be cleared when the service process stops or restarts.
-- **FR-010**: The service MUST make each check atomic with respect to other checks for the same client, so concurrent requests cannot consume the same token more than once.
-- **FR-011**: The initial service MUST exclude authentication, persistent storage, distributed or multi-instance coordination, dashboards, and user interfaces.
+- **FR-010**: The service MUST make each check atomic with respect to other checks for the same (`client_id`, `tier`) pair, so concurrent requests cannot consume the same token more than once.
+- **FR-011**: The initial service MUST expose `POST /rate-limit/check` as its only operation and MUST NOT expose documentation, OpenAPI, dashboard, or user-interface endpoints. Authentication, persistent storage, and distributed or multi-instance coordination are out of scope.
 
 ### Non-Functional Requirements
 
-- **NFR-001**: The service MUST make the same decision for the same configured inputs and elapsed-time sequence; token refill and retry calculation MUST not depend on unobservable timing.
+- **NFR-001**: The service MUST make the same decision for the same configured inputs and elapsed-time sequence. Token refill, token-availability comparisons, remaining-token calculations, and retry-delay calculations MUST use exact arithmetic without floating-point rounding error. For example, with a quota of 2 tokens per 60 seconds and an empty bucket, exactly 29 elapsed seconds MUST produce `retry_after_seconds=1`.
 - **NFR-002**: The request and response contract MUST clearly distinguish allowed requests, rate-limited requests, and invalid requests using the statuses, fields, and headers defined in FR-006 and FR-007.
 - **NFR-003**: The implementation MUST remain a single-instance, in-memory service for this release; it MUST NOT imply that decisions are shared across service instances.
 - **NFR-004**: Tier quota changes MUST NOT require changes to the token-bucket decision rules, and changing one tier's quota MUST NOT alter another tier's quota.
@@ -96,21 +106,25 @@ As a calling system, I want invalid requests to receive a clear client error wit
 - **AC-001 (FR-002, FR-008, NFR-004)**: With no overrides, the configured quotas are exactly `free=10`, `pro=100`, and `enterprise=1000` requests per 60 seconds, and the capacities are exactly `free=10`, `pro=100`, and `enterprise=1000` tokens. With only `free` quota overridden to 2 requests per 60 seconds, the effective quotas are exactly `free=2`, `pro=100`, and `enterprise=1000`, and capacities remain `free=10`, `pro=100`, and `enterprise=1000` unless separately overridden.
 - **AC-002 (FR-001, FR-003, FR-004)**: With a test configuration of `free` quota 2 per 60 seconds and capacity 2, sending `POST /rate-limit/check` with JSON `{"client_id":"alpha","tier":"free"}` twice returns HTTP 200 with `allowed=true`, `limit=2`, and `remaining` values 1 then 0; the third identical request returns HTTP 429 with `allowed=false`, `limit=2`, `remaining=0`.
 - **AC-003 (FR-003)**: With the same configuration, after client `alpha` consumes both tokens, the first check for client `beta` returns HTTP 200 with `allowed=true`, `limit=2`, and `remaining=1`.
-- **AC-004 (FR-005, FR-008)**: With quota 2 per 60 seconds and capacity 2, after consuming both tokens, a check at 29 elapsed seconds returns HTTP 429 with `retry_after_seconds=1` and `Retry-After: 1`; at 30 elapsed seconds, the next check returns HTTP 200 with `remaining=1`.
+- **AC-004 (FR-005, FR-008, NFR-001)**: With quota 2 per 60 seconds and capacity 2, after consuming both tokens, a check at exactly 29 elapsed seconds returns HTTP 429 with `retry_after_seconds=1` and `Retry-After: 1`; at exactly 30 elapsed seconds, the next check returns HTTP 200 with `remaining=0` because the one refilled token is consumed. These results MUST use exact arithmetic without floating-point rounding error.
 - **AC-005 (FR-005, FR-007)**: With quota 2 per 60 seconds and capacity 2, an immediate check after consuming both tokens returns HTTP 429, body fields `allowed=false`, `limit=2`, `remaining=0`, and `retry_after_seconds=30`, and headers `Retry-After: 30`, `X-RateLimit-Limit: 2`, and `X-RateLimit-Remaining: 0`.
 - **AC-006 (FR-006)**: For requests with missing `client_id`, null `client_id`, empty `client_id`, non-string `client_id`, missing `tier`, null `tier`, non-string `tier`, unknown tier, a top-level JSON array, and malformed JSON, respectively, the service returns HTTP 400 with the exact error bodies `{"error":"client_id is required"}`, `{"error":"client_id is required"}`, `{"error":"client_id must be a non-empty string"}`, `{"error":"client_id must be a non-empty string"}`, `{"error":"tier must be one of: free, pro, enterprise"}`, `{"error":"tier must be one of: free, pro, enterprise"}`, `{"error":"tier must be one of: free, pro, enterprise"}`, `{"error":"tier must be one of: free, pro, enterprise"}`, `{"error":"request body must be a JSON object"}`, and `{"error":"request body must be valid JSON"}`.
-- **AC-007 (FR-006)**: With `free` configured as quota 2 per 60 seconds and capacity 2, after any sequence of invalid requests for client `alpha`, its first subsequent valid check returns HTTP 200 with `remaining=1`; invalid requests do not create or consume a token.
-- **AC-008 (FR-007)**: Every allowed decision returns HTTP 200 and includes exactly the decision fields `allowed=true`, the tier's configured `limit`, and the post-consumption `remaining` value. Every rate-limited decision returns HTTP 429 and includes the fields and three headers specified in AC-005, with values matching that decision.
-- **AC-009 (FR-005)**: With quota 2 per 60 seconds and capacity 2, after 60 seconds with no requests, the bucket is still exactly 2 tokens; the next two requests are allowed and the third is rejected with `retry_after_seconds=30`.
-- **AC-010 (FR-009)**: With `free` configured as quota 2 per 60 seconds and capacity 2, after one allowed request and a service restart, the first request for that client is allowed with `remaining=1`, demonstrating that prior process state was not retained.
-- **AC-011 (FR-010)**: With `free` configured as quota 2 per 60 seconds and capacity 2, 20 simultaneous checks for a previously unused client produce exactly 2 HTTP 200 decisions and 18 HTTP 429 decisions.
-- **AC-012 (FR-011)**: The service accepts a request to `POST /rate-limit/check` without credentials, exposes no other service operation, and provides no dashboard or user interface. The deployment has one instance, and a restart clears all rate-limit state as verified by AC-010.
+- **AC-007 (FR-006)**: With `free` configured as quota 2 per 60 seconds and capacity 2, after any sequence of invalid requests for the (`alpha`, `free`) pair, its first subsequent valid check returns HTTP 200 with `remaining=1`; invalid requests do not create or consume a token.
+- **AC-008 (FR-007)**: Every allowed decision returns HTTP 200 and includes exactly the decision fields `allowed=true`, the tier's configured `limit`, and the post-consumption `remaining` value, plus `X-RateLimit-Limit` and `X-RateLimit-Remaining` headers matching `limit` and `remaining`; it does not include `Retry-After`. Every rate-limited decision returns HTTP 429 and includes the fields and three headers specified in AC-005, with values matching that decision.
+- **AC-009 (FR-005)**: With quota 2 per 60 seconds and capacity 2, after consuming both tokens and waiting 120 seconds, exactly two subsequent requests are allowed and the third returns HTTP 429 with `retry_after_seconds=30`.
+- **AC-010 (FR-009)**: With `free` configured as quota 2 per 60 seconds and capacity 2, after one allowed request, create a new service instance with empty rate-limit state to represent a restart. The first request for the same (`client_id`, `tier`) pair on the new instance is allowed with `remaining=1`, demonstrating that prior instance state was not retained.
+- **AC-011 (FR-010)**: With `free` configured as quota 2 per 60 seconds and capacity 2, and the clock frozen at one fixed time for the duration of the test, 20 simultaneous checks for a previously unused (`client_id`, `tier`) pair produce exactly 2 HTTP 200 decisions and 18 HTTP 429 decisions.
+- **AC-012 (FR-011)**: The service accepts `POST /rate-limit/check` without credentials, and this is its only operation. It exposes no documentation, OpenAPI, dashboard, or user-interface endpoints. The deployment has one instance, and creating a new instance clears all rate-limit state as verified by AC-010.
+- **AC-013 (FR-003)**: With `free` and `pro` each configured with quota 2 per 60 seconds and capacity 2, a request for `{"client_id":"alpha","tier":"free"}` followed by one for `{"client_id":"alpha","tier":"pro"}` returns HTTP 200 for both, each with `remaining=1`, demonstrating separate buckets for the two (`client_id`, `tier`) pairs.
+- **AC-014 (FR-006)**: When validation failures overlap, malformed JSON returns `{"error":"request body must be valid JSON"}` before other checks; valid non-object JSON returns `{"error":"request body must be a JSON object"}`; a JSON object with invalid `client_id` and invalid `tier` returns the applicable `client_id` error; and a JSON object with a valid `client_id` and invalid `tier` returns `{"error":"tier must be one of: free, pro, enterprise"}`. No such validation failure creates or consumes a bucket.
+- **AC-015 (FR-008)**: For every tier, configuration with a zero, negative, non-numeric, or non-finite quota or capacity is rejected and the service does not start; positive finite quota and capacity values are accepted.
+- **AC-016 (FR-005, NFR-001)**: With a bucket exhausted at time `t=100` and configured to refill one token every 30 seconds, moving the clock back to `t=90` and then returning it to `t=100` does not add tokens or change the last recorded time; a check at `t=100` remains rate-limited with `retry_after_seconds=30`.
 
 ### Key Entities
 
-- **Client**: The caller-identified subject whose requests share one independent bucket.
+- **Client**: The caller-identified subject; its bucket identity is the (`client_id`, `tier`) pair.
 - **Tier**: A named service level (`free`, `pro`, or `enterprise`) with a configurable request quota and bucket capacity.
-- **Token bucket**: A client's current whole and fractional token balance, refill rate, capacity, and time of last refill; one whole token authorizes one request.
+- **Token bucket**: A (`client_id`, `tier`) pair's current whole and fractional token balance, refill rate, capacity, and time of last refill; one whole token authorizes one request.
 - **Rate-limit decision**: The result for one check, including allow/reject status, configured limit, remaining capacity, and (when rejected) retry delay.
 
 ## Success Criteria *(mandatory)*
@@ -120,19 +134,24 @@ As a calling system, I want invalid requests to receive a clear client error wit
 - **SC-001**: The three default tier quotas are exactly 10, 100, and 1000 requests per 60 seconds, and all three are independently configurable.
 - **SC-002**: In configured scenarios, the number of allowed requests never exceeds available whole tokens; each allowed request consumes exactly one token and each rejected request consumes zero tokens.
 - **SC-003**: For all valid allow and reject scenarios, 100% of returned statuses, response values, and required headers match the values defined in the acceptance criteria.
-- **SC-004**: For every invalid-request scenario in AC-006, the service returns the exact specified error response and leaves the client's available tokens unchanged.
+- **SC-004**: For every invalid-request scenario in AC-006, the service returns the exact specified error response and leaves the affected (`client_id`, `tier`) pair's available tokens unchanged.
 - **SC-005**: Rate-limit state is cleared on restart, and all decisions are made using only one service instance's in-memory state.
 
 ## Assumptions
 
-- A new client's bucket starts full at its configured capacity.
+- A new (`client_id`, `tier`) pair's bucket starts full at its configured capacity.
+- Bucket identity is the (`client_id`, `tier`) pair; the same client identifier submitted under different tiers has independent state.
 - The configured per-minute quota refills evenly over time (for example, two tokens per minute yields one token every 30 seconds, including fractional progress between whole tokens).
 - Retry delays are reported as whole seconds, rounded up to the next second.
+- The reported `limit` and `X-RateLimit-Limit` are the configured per-minute quota; bucket capacity separately controls the maximum token balance.
+- Refill, availability, remaining-balance, and retry-delay calculations use exact arithmetic without floating-point rounding error.
+- When the clock moves backwards, elapsed time is treated as zero and the bucket's last recorded time is retained.
 - Tier configuration is supplied when the service starts; no runtime configuration management interface is included.
 - Client identifiers are non-empty strings and are treated as case-sensitive.
+- A restart is represented by creating a new service instance with empty rate-limit state; its first bucket for a pair starts full according to that tier's configured capacity.
 - Extra fields in an otherwise valid request are ignored.
 - The only supported tier names are `free`, `pro`, and `enterprise`.
 
 ## Unresolved Questions
 
-- None. Q1 was resolved: the default capacities equal their per-minute quotas (free=10, pro=100, enterprise=1000 tokens); capacities may still be configured separately.
+- Whether performance and observability targets are in scope for this release remains unresolved.
